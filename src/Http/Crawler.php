@@ -30,6 +30,11 @@ class Crawler implements ClientInterface, RequestFactoryInterface, UriFactoryInt
         $this->urlPolicy = $this->client instanceof CurlClient ? $this->client->getUrlPolicy() : UrlPolicy::default();
     }
 
+    /**
+     * The policy is copied onto the HTTP client only when that client is
+     * exactly CurlClient. A decorator around CurlClient is not detected;
+     * set the policy on the inner client as well.
+     */
     public function setUrlPolicy(UrlPolicy $urlPolicy): void
     {
         $this->urlPolicy = $urlPolicy;

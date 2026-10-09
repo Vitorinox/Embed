@@ -329,12 +329,12 @@ $client = new CurlClient();
 $client->setSettings([
     'cookies_path' => $cookies_path,
     'ignored_errors' => [18],
-    'max_redirs' => 3,               // maximum number of redirects to follow
-    'connect_timeout' => 2,          // see CURLOPT_CONNECTTIMEOUT
-    'timeout' => 2,                  // see CURLOPT_TIMEOUT
-    'ssl_verify_host' => 2,          // see CURLOPT_SSL_VERIFYHOST
+    'max_redirs' => 3,               // redirects to follow; a negative value means up to 50
+    'connect_timeout' => 2,          // per connection, see CURLOPT_CONNECTTIMEOUT
+    'timeout' => 2,                  // total seconds for the request, including redirects
+    'ssl_verify_host' => 2,          // 0 disables hostname checks; any other value enables them
     'ssl_verify_peer' => 1,          // see CURLOPT_SSL_VERIFYPEER
-    'follow_location' => true,       // follow redirects; every hop is checked
+    'follow_location' => true,       // false returns the 3xx; each hop is checked
     'user_agent' => 'Mozilla',       // see CURLOPT_USERAGENT
 ]);
 
@@ -361,7 +361,9 @@ Note: The built-in detectors does not require settings. This feature is only for
 
 ## Security / SSRF protection
 
-The default HTTP client refuses to connect to non-public addresses. That covers the URL you pass to `get()` / `getMulti()` and every later request Embed makes itself (redirects, oEmbed endpoints declared by the page, adapter APIs, and meta-refresh targets). A hostname is allowed only when every IPv4 address it resolves to is public. Loopback, private, link-local, CGNAT, documentation, and multicast ranges are rejected, including the addresses embedded in IPv4-mapped IPv6, NAT64, 6to4, and Teredo. Only `http` and `https` are allowed, and redirects are followed inside Embed so each hop is checked the same way. `follow_location` and `max_redirs` still mean what they did before.
+The default HTTP client refuses to connect to non-public addresses. That covers the URL you pass to `get()` / `getMulti()` and every later request Embed makes itself (redirects, oEmbed endpoints declared by the page, adapter APIs, and meta-refresh targets). A hostname is allowed only when every IPv4 address it resolves to is public. Loopback, private, link-local, CGNAT, documentation, and multicast ranges are rejected. IPv4-mapped IPv6, NAT64, and 6to4 are rejected when the embedded IPv4 address is not public. The Teredo prefix `2001::/32` is rejected as a whole, not by reading an address out of it. Only `http` and `https` are allowed, and redirects are followed inside Embed so each hop is checked the same way.
+
+`follow_location` set to false still returns the 3xx response. `max_redirs` is still how many redirects are followed (10 by default). A negative value, which curl treated as unlimited, follows at most 50. `timeout` is the total time for the request and its redirects; `connect_timeout` is still per connection. `ssl_verify_host` of `0` disables hostname checks, and any other value enables them, as curl does when it receives `1` or `true`. Reaching the redirect limit still fails with curl error 47. The message is `Number of redirects hit maximum amount`.
 
 This is a behavior change: a URL that used to be fetched from an intranet now throws `Embed\Http\BlockedRequestException`. To opt back in:
 
@@ -394,7 +396,9 @@ if ($image !== null) {
 }
 ```
 
-A page-declared oEmbed endpoint, adapter API, or meta-refresh target that the policy rejects is skipped, and extraction continues with the rest of the page. The URL passed to `get()` or `getMulti()` is not skipped: that request throws. In `getMulti()`, one rejected URL rejects the whole batch before any request is sent.
+A page-declared oEmbed endpoint, adapter API, or meta-refresh target that the policy rejects is skipped, and extraction continues with the rest of the page. The URL passed to `get()` or `getMulti()` is not skipped: that request throws. In `getMulti()`, one rejected URL rejects the whole batch before any request is sent. A redirect discovered after the batch has started is checked on the same thread, including its DNS lookup, so the other transfers in that batch wait until the check returns.
+
+`Crawler::setUrlPolicy()` copies the policy onto the client only when that client is exactly `Embed\Http\CurlClient`. A decorator or other wrapper around `CurlClient` is not updated. Call `setUrlPolicy()` on the inner client as well. Otherwise the wrapper is pre-checked with the crawler's policy, and the inner client keeps the policy it already had.
 
 ### Custom PSR-18 clients
 

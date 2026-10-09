@@ -53,7 +53,7 @@ final class IpClassifier
         ['ff00::', 8],
         ['2001:db8::', 32],
         ['100::', 64],
-        ['2001::', 32],
+        ['2001::', 32], // Teredo: the whole prefix, not the embedded IPv4
         ['64:ff9b:1::', 48],
     ];
 
