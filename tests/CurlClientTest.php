@@ -198,6 +198,7 @@ class CurlClientTest extends TestCase
             $this->fail('The eleventh redirect must fail.');
         } catch (NetworkException $exception) {
             $this->assertSame(47, $exception->getCode());
+            $this->assertSame('Number of redirects hit maximum amount', $exception->getMessage());
         }
 
         $queries = array_map(static function (array $row): string {
@@ -206,6 +207,91 @@ class CurlClientTest extends TestCase
         $this->assertNotContains('i=11&n=11', $queries);
         $this->assertContains('i=10&n=11', $queries);
         $this->assertCount(11, $queries);
+    }
+
+    public function testNegativeMaxRedirsFollowsUpToTheCap(): void
+    {
+        $response = $this->client(['max_redirs' => -1])->sendRequest($this->request($this->url('/chain?i=0&n=3')));
+
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertSame(['/chain', '/chain', '/chain', '/chain'], self::$server->paths());
+
+        self::$server->clearLog();
+
+        try {
+            $this->client(['max_redirs' => -1])->sendRequest($this->request($this->url('/chain?i=0&n=51')));
+            $this->fail('A negative max_redirs is capped at 50.');
+        } catch (NetworkException $exception) {
+            $this->assertSame(47, $exception->getCode());
+        }
+
+        $queries = array_map(static function (array $row): string {
+            return $row['query'] ?? '';
+        }, self::$server->requests());
+        $this->assertContains('i=50&n=51', $queries);
+        $this->assertNotContains('i=51&n=51', $queries);
+        $this->assertCount(51, $queries);
+    }
+
+    public function testTimeoutIsABudgetAcrossRedirects(): void
+    {
+        $next = rawurlencode('/pause?ms=700');
+
+        try {
+            $this->client(['timeout' => 1])->sendRequest($this->request($this->url('/pause?ms=700&to='.$next)));
+            $this->fail('Two pauses must exceed the total timeout.');
+        } catch (NetworkException $exception) {
+            $this->assertSame(28, $exception->getCode());
+        }
+
+        $within = $this->client(['timeout' => 2])->sendRequest($this->request($this->url('/pause?ms=300')));
+        $this->assertSame(200, $within->getStatusCode());
+    }
+
+    public function testSslVerifyHostTruthyValuesKeepHostnameChecks(): void
+    {
+        $tls = $this->startTlsServer();
+
+        try {
+            $url = 'https://allowed.test:'.$tls['port'].'/';
+            foreach ([0, false, '0'] as $disabled) {
+                $response = $this->client([
+                    'ssl_verify_host' => $disabled,
+                    'ssl_verify_peer' => false,
+                ])->sendRequest($this->request($url));
+                $this->assertSame(200, $response->getStatusCode(), 'disabled '.var_export($disabled, true));
+            }
+
+            $notices = [];
+            set_error_handler(static function (int $severity, string $message) use (&$notices): bool {
+                if (stripos($message, 'SSL_VERIFYHOST') !== false) {
+                    $notices[] = $message;
+                }
+
+                return true;
+            });
+
+            try {
+                foreach ([true, 1, '1', 2, '2'] as $enabled) {
+                    try {
+                        $this->client([
+                            'ssl_verify_host' => $enabled,
+                            'ssl_verify_peer' => false,
+                        ])->sendRequest($this->request($url));
+                        $this->fail('Hostname verification must stay on for '.var_export($enabled, true));
+                    } catch (NetworkException $exception) {
+                        $this->assertSame(60, $exception->getCode(), var_export($enabled, true));
+                        $this->assertStringContainsString('does not match target host name', $exception->getMessage());
+                    }
+                }
+            } finally {
+                restore_error_handler();
+            }
+
+            $this->assertSame([], $notices);
+        } finally {
+            $this->stopTlsServer($tls);
+        }
     }
 
     public function testFollowLocationFalseReturnsTheRedirect(): void
@@ -401,6 +487,98 @@ class CurlClientTest extends TestCase
         }
 
         $this->fail('Expected BlockedRequestException');
+    }
+
+    /**
+     * @return array{port: int, process: resource, paths: array<int, string>}
+     */
+    private function startTlsServer(): array
+    {
+        $directory = sys_get_temp_dir().'/embed-tls-'.bin2hex(random_bytes(4));
+        if (!mkdir($directory) && !is_dir($directory)) {
+            $this->fail('Unable to create a certificate directory');
+        }
+
+        $key = $directory.'/key.pem';
+        $cert = $directory.'/cert.pem';
+        $command = 'openssl req -x509 -newkey rsa:2048 -keyout '.escapeshellarg($key).' -out '.escapeshellarg($cert).' -days 1 -nodes -subj /CN=mismatch.test 2>/dev/null';
+        exec($command, $output, $exitCode);
+        if ($exitCode !== 0 || !is_file($cert)) {
+            $this->fail('Unable to create a TLS certificate');
+        }
+
+        $port = self::allocatePort();
+        $stderr = $directory.'/stderr';
+        $process = proc_open(
+            ['openssl', 's_server', '-accept', '127.0.0.1:'.$port, '-cert', $cert, '-key', $key, '-www'],
+            [
+                0 => ['pipe', 'r'],
+                1 => ['file', $directory.'/stdout', 'w'],
+                2 => ['file', $stderr, 'w'],
+            ],
+            $pipes
+        );
+        if (!is_resource($process)) {
+            $this->fail('Unable to start the TLS server');
+        }
+        fclose($pipes[0]);
+
+        $deadline = microtime(true) + 5;
+        while (microtime(true) < $deadline) {
+            $socket = @fsockopen('127.0.0.1', $port, $errno, $error, 0.2);
+            if (is_resource($socket)) {
+                fclose($socket);
+
+                return ['port' => $port, 'process' => $process, 'paths' => [$directory, $key, $cert, $stderr, $directory.'/stdout']];
+            }
+            usleep(50000);
+        }
+
+        proc_terminate($process);
+        proc_close($process);
+        $details = is_file($stderr) ? (string) file_get_contents($stderr) : '';
+        $this->fail('TLS server did not start: '.$details);
+    }
+
+    /**
+     * @param array{port: int, process: resource, paths: array<int, string>} $tls
+     */
+    private function stopTlsServer(array $tls): void
+    {
+        proc_terminate($tls['process']);
+        proc_close($tls['process']);
+        $directories = [];
+        foreach ($tls['paths'] as $path) {
+            if (is_file($path)) {
+                unlink($path);
+            } elseif (is_dir($path)) {
+                $directories[] = $path;
+            }
+        }
+        foreach ($directories as $directory) {
+            rmdir($directory);
+        }
+    }
+
+    private static function allocatePort(): int
+    {
+        $socket = stream_socket_server('tcp://127.0.0.1:0', $errno, $error);
+        if ($socket === false) {
+            throw new \RuntimeException('Unable to allocate a port: '.$error);
+        }
+
+        $name = stream_socket_get_name($socket, false);
+        fclose($socket);
+        if (!is_string($name)) {
+            throw new \RuntimeException('Unable to read the allocated port');
+        }
+
+        $colon = strrpos($name, ':');
+        if ($colon === false) {
+            throw new \RuntimeException('Unable to read the allocated port');
+        }
+
+        return (int) substr($name, $colon + 1);
     }
 
     private static function clearProxyEnvironment(): void

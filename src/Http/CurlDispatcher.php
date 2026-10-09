@@ -13,10 +13,12 @@ use Psr\Http\Message\StreamInterface;
 use Psr\Http\Message\UriFactoryInterface;
 
 /**
- * Class to fetch html pages.
+ * Class to fetch html pages
  *
  * Redirects are followed here, not by libcurl, so every hop is checked against
  * the URL policy and pinned to the addresses that were validated.
+ *
+ * @phpstan-type CurlResource resource|\CurlHandle
  */
 final class CurlDispatcher
 {
@@ -28,7 +30,10 @@ final class CurlDispatcher
     private StreamFactoryInterface $streamFactory;
     private UriFactoryInterface $uriFactory;
     private UrlPolicy $policy;
-    /** @var \CurlHandle */
+    /**
+     * @var resource|\CurlHandle
+     * @phpstan-ignore property.unusedType (resource type needed for PHP 7.4 compatibility)
+     */
     private $curl;
     /** @var array<array{0: string, 1: string}> */
     private array $headers = [];
@@ -42,12 +47,13 @@ final class CurlDispatcher
     private bool $proxy;
     private bool $follow;
     private int $maxRedirs;
+    private ?float $deadline;
     private bool $prereqBlocked = false;
     private bool $closed = false;
     private int $followed = 0;
 
     /**
-     * @param  array<string, mixed> $settings
+     * @param array<string, mixed> $settings
      * @return ResponseInterface[]
      */
     public static function fetch(array $settings, ResponseFactoryInterface $responseFactory, RequestInterface ...$requests): array
@@ -104,9 +110,9 @@ final class CurlDispatcher
     }
 
     /**
-     * @param  array<string, mixed>           $settings
-     * @param  array<int, RequestInterface>   $requests
-     * @param  array<int, array<int, string>> $pins
+     * @param array<string, mixed> $settings
+     * @param array<int, RequestInterface> $requests
+     * @param array<int, array<int, string>> $pins
      * @return ResponseInterface[]
      */
     private static function fetchMulti(
@@ -118,14 +124,20 @@ final class CurlDispatcher
         bool $proxy
     ): array {
         $multi = curl_multi_init();
+        // curl_multi_init() can fail on PHP 7.4. Current stubs type it as CurlMultiHandle only.
+        /** @phpstan-ignore identical.alwaysFalse */
+        if ($multi === false) {
+            throw new NetworkException('Unable to initialize curl', 0, $requests[0]);
+        }
         $connections = [];
 
         try {
             foreach ($requests as $index => $request) {
                 $connection = new self($settings, $request, $pins[$index], $policy, $proxy);
                 $connections[] = $connection;
-                $curlHandle = $connection->curl;
-                curl_multi_add_handle($multi, $curlHandle);
+                // PHP 7.4: $multi and the easy handle are resources.
+                /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
+                curl_multi_add_handle($multi, $connection->curl);
             }
 
             self::pump($multi, $connections);
@@ -145,7 +157,9 @@ final class CurlDispatcher
     }
 
     /**
-     * @param \CurlMultiHandle $multi
+     * On PHP 7.4 $multi is a resource. PHP 8 uses CurlMultiHandle.
+     *
+     * @param resource|\CurlMultiHandle $multi
      * @param array<int, self> $connections
      */
     private static function pump($multi, array $connections): void
@@ -155,11 +169,13 @@ final class CurlDispatcher
 
         do {
             do {
+                /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
                 $status = curl_multi_exec($multi, $active);
             } while ($status === CURLM_CALL_MULTI_PERFORM);
 
             $requeued = false;
             while (true) {
+                /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
                 $info = curl_multi_info_read($multi);
                 if (!is_array($info)) {
                     break;
@@ -180,7 +196,9 @@ final class CurlDispatcher
                     }
 
                     $curlHandle = $connection->curl;
+                    /** @phpstan-ignore argument.type, argument.type (PHP 7.4/8.0 compatibility) */
                     curl_multi_remove_handle($multi, $curlHandle);
+                    /** @phpstan-ignore argument.type, argument.type (PHP 7.4/8.0 compatibility) */
                     curl_multi_add_handle($multi, $curlHandle);
                     $requeued = true;
                     break;
@@ -192,6 +210,7 @@ final class CurlDispatcher
             }
 
             if ($active !== 0 && $status === CURLM_OK) {
+                /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
                 $selected = curl_multi_select($multi, 1.0);
                 if ($selected === -1) {
                     usleep(10000);
@@ -201,13 +220,16 @@ final class CurlDispatcher
     }
 
     /**
-     * @param \CurlMultiHandle $multi
+     * On PHP 7.4 $multi is a resource. PHP 8 uses CurlMultiHandle.
+     *
+     * @param resource|\CurlMultiHandle $multi
      * @param array<int, self> $connections
      */
     private static function releaseMulti($multi, array $connections, bool $closeHandles): void
     {
         foreach ($connections as $connection) {
             $curlHandle = $connection->curl;
+            /** @phpstan-ignore argument.type, argument.type (PHP 7.4/8.0 compatibility) */
             curl_multi_remove_handle($multi, $curlHandle);
             if ($closeHandles) {
                 $connection->closeCurl();
@@ -215,13 +237,14 @@ final class CurlDispatcher
         }
 
         if (PHP_VERSION_ID < 80000) {
+            /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
             curl_multi_close($multi);
         }
     }
 
     /**
      * @param array<string, mixed> $settings
-     * @param array<int, string>   $pinnedIps
+     * @param array<int, string> $pinnedIps
      */
     private function __construct(array $settings, RequestInterface $request, array $pinnedIps, UrlPolicy $policy, bool $proxy)
     {
@@ -236,7 +259,11 @@ final class CurlDispatcher
         $this->policy = $policy;
         $this->proxy = $proxy;
         $this->follow = $this->settingBool('follow_location', true);
-        $this->maxRedirs = max(0, $this->settingInt('max_redirs', 10));
+        $this->maxRedirs = $this->redirectLimit();
+        $timeout = $this->settingInt('timeout', 10);
+        // libcurl's CURLOPT_TIMEOUT covers the whole transfer, including
+        // redirects. Each hop receives only the time that is still left.
+        $this->deadline = $timeout > 0 ? microtime(true) + $timeout : null;
         $this->streamFactory = FactoryDiscovery::getStreamFactory();
         $this->uriFactory = FactoryDiscovery::getUriFactory();
         $this->curl = $curl;
@@ -249,6 +276,12 @@ final class CurlDispatcher
     {
         while (true) {
             $this->resetExchange();
+            if ($this->timeoutExpired()) {
+                $this->error = CURLE_OPERATION_TIMEDOUT;
+
+                return;
+            }
+            $this->applyTimeout();
             $this->execOnce();
             $this->guardConnection();
 
@@ -305,12 +338,20 @@ final class CurlDispatcher
             return false;
         }
 
+        if ($this->timeoutExpired()) {
+            $this->error = CURLE_OPERATION_TIMEDOUT;
+
+            return false;
+        }
+
         $next = $this->redirectRequest();
         if ($next === null) {
             return false;
         }
 
         $this->request = $next;
+        // DNS for this hop runs here, on the multi thread, so the other
+        // transfers in the batch wait until validate() returns.
         $this->pinnedIps = $this->policy->validate($next);
         $this->applyToHandle();
         $this->resetExchange();
@@ -322,6 +363,7 @@ final class CurlDispatcher
     private function execOnce(): void
     {
         $curlHandle = $this->curl;
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         curl_exec($curlHandle);
     }
 
@@ -338,11 +380,13 @@ final class CurlDispatcher
         $this->guardPrimaryIp();
 
         $curlHandle = $this->curl;
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         $errno = curl_errno($curlHandle);
         if ($errno === 0 || ($this->isBinary && $errno === CURLE_WRITE_ERROR)) {
             return;
         }
 
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         $this->error(curl_error($curlHandle), $errno);
     }
 
@@ -353,6 +397,7 @@ final class CurlDispatcher
         }
 
         $curlHandle = $this->curl;
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         $ip = curl_getinfo($curlHandle, CURLINFO_PRIMARY_IP);
         if ($ip === '') {
             return;
@@ -475,7 +520,6 @@ final class CurlDispatcher
         $caBundle = CaBundle::getSystemCaRootBundlePath();
 
         $this->setopt(CURLOPT_CONNECTTIMEOUT, $this->settingInt('connect_timeout', 10));
-        $this->setopt(CURLOPT_TIMEOUT, $this->settingInt('timeout', 10));
         $this->setopt(CURLOPT_RETURNTRANSFER, true);
         $this->setopt(CURLOPT_SSL_VERIFYHOST, $this->sslVerifyHost());
         $this->setopt(CURLOPT_SSL_VERIFYPEER, $this->sslVerifyPeer());
@@ -537,6 +581,8 @@ final class CurlDispatcher
         $this->setopt(CURLOPT_URL, (string) $this->request->getUri());
         $this->setopt(CURLOPT_HTTPHEADER, $this->getRequestHeaders());
 
+        $this->applyTimeout();
+
         $method = strtoupper($this->request->getMethod());
         if ($method === 'POST') {
             $this->setopt(CURLOPT_POST, true);
@@ -595,6 +641,7 @@ final class CurlDispatcher
     private function buildResponse(ResponseFactoryInterface $responseFactory): ResponseInterface
     {
         $curlHandle = $this->curl;
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         $info = curl_getinfo($curlHandle);
 
         if ($this->error !== null && $this->error !== 0) {
@@ -602,15 +649,17 @@ final class CurlDispatcher
             $this->error($message === null ? 'curl error' : $message, $this->error);
         }
 
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         $errno = curl_errno($curlHandle);
         if ($errno !== 0 && !($this->isBinary && $errno === CURLE_WRITE_ERROR)) {
+            /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
             $this->error(curl_error($curlHandle), $errno);
         }
 
         $response = $responseFactory->createResponse($info['http_code']);
 
         foreach ($this->headers as $header) {
-            [$name, $value] = $header;
+            list($name, $value) = $header;
             $response = $response->withAddedHeader($name, $value);
         }
 
@@ -621,6 +670,7 @@ final class CurlDispatcher
             ->withAddedHeader('X-Request-Time', sprintf('%.3f ms', $info['total_time']));
 
         if ($this->body !== null) {
+            //5Mb max
             $this->body->rewind();
             $response = $response->withBody($this->body);
             $this->body = null;
@@ -638,6 +688,7 @@ final class CurlDispatcher
         }
 
         if ($this->isBinary && $code === CURLE_WRITE_ERROR) {
+            // The write callback aborted the request to prevent a download of the binary file
             return;
         }
 
@@ -654,6 +705,7 @@ final class CurlDispatcher
 
         $this->closed = true;
         $curlHandle = $this->curl;
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         curl_close($curlHandle);
     }
 
@@ -669,6 +721,7 @@ final class CurlDispatcher
     private function httpStatus(): int
     {
         $curlHandle = $this->curl;
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         return curl_getinfo($curlHandle, CURLINFO_HTTP_CODE);
     }
 
@@ -678,6 +731,7 @@ final class CurlDispatcher
     private function setopt(int $option, $value): void
     {
         $curlHandle = $this->curl;
+        /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         curl_setopt($curlHandle, $option, $value);
     }
 
@@ -710,15 +764,55 @@ final class CurlDispatcher
         return $default;
     }
 
-    /** @return 0|2 */
+    /**
+     * libcurl accepts only 0 and 2. PHP turns 1 into 2 and emits a notice,
+     * which is what a truthy setting used to do when it was passed through.
+     *
+     * @return 0|2
+     */
     private function sslVerifyHost(): int
     {
         $value = $this->settings['ssl_verify_host'] ?? 0;
-        if ($value === 2 || $value === '2') {
-            return 2;
+        if ($value === false || $value === 0 || $value === 0.0 || $value === '' || $value === '0') {
+            return 0;
         }
 
-        return 0;
+        return 2;
+    }
+
+    /**
+     * A negative max_redirs is curl's "unlimited". Cap it so a redirect loop
+     * cannot run without a bound now that we follow hops ourselves.
+     */
+    private function redirectLimit(): int
+    {
+        $limit = $this->settingInt('max_redirs', 10);
+        if ($limit < 0) {
+            return 50;
+        }
+
+        return $limit;
+    }
+
+    private function timeoutExpired(): bool
+    {
+        return $this->deadline !== null && microtime(true) >= $this->deadline;
+    }
+
+    private function applyTimeout(): void
+    {
+        if ($this->deadline === null) {
+            $this->setopt(CURLOPT_TIMEOUT, 0);
+
+            return;
+        }
+
+        $remainingMs = (int) floor(($this->deadline - microtime(true)) * 1000);
+        if ($remainingMs < 1) {
+            $remainingMs = 1;
+        }
+
+        $this->setopt(CURLOPT_TIMEOUT_MS, $remainingMs);
     }
 
     private function sslVerifyPeer(): bool
@@ -747,18 +841,19 @@ final class CurlDispatcher
     }
 
     /**
-     * @return array<int, string>
+     * @return array<string>
      */
     private function getRequestHeaders(): array
     {
         $headers = [];
 
         foreach ($this->request->getHeaders() as $name => $values) {
-            if (strtolower($name) === 'user-agent') {
-                continue;
+            switch (strtolower($name)) {
+                case 'user-agent':
+                break;
+                default:
+                $headers[] = $name . ':' . implode(', ', $values);
             }
-
-            $headers[] = $name.':'.implode(', ', $values);
         }
 
         return $headers;
@@ -766,7 +861,7 @@ final class CurlDispatcher
 
     /**
      * @param resource|\CurlHandle $curl
-     * @param mixed                $string
+     * @param mixed $string
      */
     private function writeHeader($curl, $string): int
     {
@@ -792,7 +887,7 @@ final class CurlDispatcher
 
     /**
      * @param resource|\CurlHandle $curl
-     * @param mixed                $string
+     * @param mixed $string
      */
     private function writeBody($curl, $string): int
     {

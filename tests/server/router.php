@@ -95,6 +95,24 @@ if ($path === '/switch') {
     return;
 }
 
+if ($path === '/pause') {
+    $ms = isset($params['ms']) ? (int) $params['ms'] : 0;
+    if ($ms > 0) {
+        usleep(min($ms, 5000) * 1000);
+    }
+    $to = isset($params['to']) && is_string($params['to']) ? $params['to'] : '';
+    if ($to !== '') {
+        header('Location: '.$to, true, 302);
+        echo 'redirect';
+
+        return;
+    }
+    http_response_code(200);
+    echo 'ok';
+
+    return;
+}
+
 if ($path === '/secret') {
     http_response_code(200);
     echo 'LEAKED';
