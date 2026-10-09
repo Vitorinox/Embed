@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [Unreleased]
+### Security
+- Block requests to non-public addresses before they are sent, including redirects, page-declared oEmbed endpoints, adapter APIs, and meta-refresh targets. Intended for 4.5.0. Private and loopback URLs are rejected unless `UrlPolicy::allowPrivateNetworks()` or `withAllowedHosts()` is used [#573]
+
+### Added
+- `Embed\Http\UrlPolicy` and `Embed\Http\BlockedRequestException`, configurable from `Crawler::setUrlPolicy()`
+
+### Fixed
+- `resolveUri()` dropped the port of the base URL
+- Read every `curl_multi_info_read` message in the parallel client instead of only one per iteration
+
 ## [4.4.19] - 2026-07-08
 ### Changed
 - Access tokens are now optional with Meta (Facebook & Instagram) [#577]
@@ -301,6 +312,7 @@ Full library refactoring.
 [#572]: https://github.com/oscarotero/Embed/issues/572
 [#574]: https://github.com/oscarotero/Embed/issues/574
 [#577]: https://github.com/oscarotero/Embed/issues/577
+[#573]: https://github.com/php-embed/Embed/issues/573
 
 [4.4.19]: https://github.com/oscarotero/Embed/compare/v4.4.18...v4.4.19
 [4.4.18]: https://github.com/oscarotero/Embed/compare/v4.4.17...v4.4.18
