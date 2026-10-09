@@ -70,7 +70,7 @@ final class CurlDispatcher
         }
 
         if (count($requests) === 1) {
-            $connection = new self($settings, $requests[0], $pins[0], $policy, $proxy);
+            $connection = new static($settings, $requests[0], $pins[0], $policy, $proxy);
             try {
                 $connection->execute();
 
@@ -123,6 +123,7 @@ final class CurlDispatcher
         UrlPolicy $policy,
         bool $proxy
     ): array {
+        //Init connections
         $multi = curl_multi_init();
         // curl_multi_init() can fail on PHP 7.4. Current stubs type it as CurlMultiHandle only.
         /** @phpstan-ignore identical.alwaysFalse */
@@ -133,19 +134,22 @@ final class CurlDispatcher
 
         try {
             foreach ($requests as $index => $request) {
-                $connection = new self($settings, $request, $pins[$index], $policy, $proxy);
+                $connection = new static($settings, $request, $pins[$index], $policy, $proxy);
                 $connections[] = $connection;
-                // PHP 7.4: $multi and the easy handle are resources.
+                /** @var resource|\CurlHandle $curlHandle */
+                $curlHandle = $connection->curl;
                 /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
-                curl_multi_add_handle($multi, $connection->curl);
+                curl_multi_add_handle($multi, $curlHandle);
             }
 
+            //Run
             self::pump($multi, $connections);
         } catch (\Throwable $exception) {
             self::releaseMulti($multi, $connections, true);
             throw $exception;
         }
 
+        //Close connections
         self::releaseMulti($multi, $connections, false);
 
         $responses = [];
@@ -228,6 +232,7 @@ final class CurlDispatcher
     private static function releaseMulti($multi, array $connections, bool $closeHandles): void
     {
         foreach ($connections as $connection) {
+            /** @var resource|\CurlHandle $curlHandle */
             $curlHandle = $connection->curl;
             /** @phpstan-ignore argument.type, argument.type (PHP 7.4/8.0 compatibility) */
             curl_multi_remove_handle($multi, $curlHandle);
@@ -362,6 +367,7 @@ final class CurlDispatcher
 
     private function execOnce(): void
     {
+        /** @var resource|\CurlHandle $curlHandle */
         $curlHandle = $this->curl;
         /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         curl_exec($curlHandle);
@@ -640,13 +646,14 @@ final class CurlDispatcher
 
     private function buildResponse(ResponseFactoryInterface $responseFactory): ResponseInterface
     {
+        /** @var resource|\CurlHandle $curlHandle */
         $curlHandle = $this->curl;
         /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
         $info = curl_getinfo($curlHandle);
 
         if ($this->error !== null && $this->error !== 0) {
-            $message = curl_strerror($this->error);
-            $this->error($message === null ? 'curl error' : $message, $this->error);
+            /** @phpstan-ignore argument.type (curl_strerror returns string|null in some versions) */
+            $this->error(curl_strerror($this->error), $this->error);
         }
 
         /** @phpstan-ignore argument.type (PHP 7.4/8.0 compatibility) */
@@ -815,9 +822,18 @@ final class CurlDispatcher
         $this->setopt(CURLOPT_TIMEOUT_MS, $remainingMs);
     }
 
+    /**
+     * Same rule as a value passed straight to curl: only a falsy setting
+     * disables certificate verification. 2, "true" and "yes" stay enabled.
+     */
     private function sslVerifyPeer(): bool
     {
-        return $this->settingBool('ssl_verify_peer', false);
+        $value = $this->settings['ssl_verify_peer'] ?? false;
+        if ($value === false || $value === 0 || $value === 0.0 || $value === '' || $value === '0' || $value === []) {
+            return false;
+        }
+
+        return true;
     }
 
     private function userAgent(): string

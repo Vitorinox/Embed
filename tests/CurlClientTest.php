@@ -281,7 +281,7 @@ class CurlClientTest extends TestCase
                         $this->fail('Hostname verification must stay on for '.var_export($enabled, true));
                     } catch (NetworkException $exception) {
                         $this->assertSame(60, $exception->getCode(), var_export($enabled, true));
-                        $this->assertStringContainsString('does not match target host name', $exception->getMessage());
+                        $this->assertMatchesRegularExpression('/target host ?name/i', $exception->getMessage());
                     }
                 }
             } finally {
@@ -289,6 +289,37 @@ class CurlClientTest extends TestCase
             }
 
             $this->assertSame([], $notices);
+        } finally {
+            $this->stopTlsServer($tls);
+        }
+    }
+
+    public function testSslVerifyPeerFalsyValuesAreTheOnlyOnesDisabled(): void
+    {
+        $tls = $this->startTlsServer();
+
+        try {
+            $url = 'https://allowed.test:'.$tls['port'].'/';
+            foreach ([0, false, '0', '', null] as $disabled) {
+                $response = $this->client([
+                    'ssl_verify_host' => 0,
+                    'ssl_verify_peer' => $disabled,
+                ])->sendRequest($this->request($url));
+                $this->assertSame(200, $response->getStatusCode(), 'disabled '.var_export($disabled, true));
+            }
+
+            foreach ([true, 1, 2, '2', 'true', 'yes'] as $enabled) {
+                try {
+                    $this->client([
+                        'ssl_verify_host' => 0,
+                        'ssl_verify_peer' => $enabled,
+                    ])->sendRequest($this->request($url));
+                    $this->fail('Certificate verification must stay on for '.var_export($enabled, true));
+                } catch (NetworkException $exception) {
+                    $this->assertSame(60, $exception->getCode(), var_export($enabled, true));
+                    $this->assertStringContainsString('certificate', $exception->getMessage());
+                }
+            }
         } finally {
             $this->stopTlsServer($tls);
         }
